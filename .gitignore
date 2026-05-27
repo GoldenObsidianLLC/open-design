@@ -68,3 +68,6 @@ docs/superpowers/
 apps/landing-page/public/previews/
 
 growth/**
+
+# Vector DB (local-only)
+ruvector.db
