@@ -1,178 +1,314 @@
-import type { Express } from 'express';
+import type { Express, Request, Response } from 'express';
 import fs from 'node:fs';
+import { createApiError } from '@open-design/contracts';
 import { SIDECAR_ENV } from '@open-design/sidecar-proto';
 import { buildMcpInstallPayload } from './mcp-install-info.js';
-import { MCP_TEMPLATES, buildAcpMcpServers, buildClaudeMcpJson, isManagedProjectCwd, readMcpConfig, writeMcpConfig } from './mcp-config.js';
-import { beginAuth, exchangeCodeForToken, refreshAccessToken } from './mcp-oauth.js';
-import { clearToken, getToken, isTokenExpired, readAllTokens, setToken } from './mcp-tokens.js';
+import { MCP_TEMPLATES, readMcpConfig, writeMcpConfig, type McpConfig, type McpServerConfig, type McpTemplate } from './mcp-config.js';
+import { beginAuth, exchangeCodeForToken, type BeginAuthInput, type BeginAuthResult, type PendingAuthCache } from './mcp-oauth.js';
+import { clearToken, getToken, setToken, type StoredMcpToken } from './mcp-tokens.js';
 import type { RouteDeps } from './server-context.js';
+import { defineJsonRoute, err, mountJsonRoute, ok, type Result } from './http/index.js';
 
 export interface RegisterMcpRoutesDeps extends RouteDeps<'http' | 'paths' | 'mcp'> {}
 
-export function registerMcpRoutes(app: Express, ctx: RegisterMcpRoutesDeps) {
-  const { isLocalSameOrigin, resolvedPortRef, sendApiError } = ctx.http;
-  const { OD_BIN, RUNTIME_DATA_DIR, PROJECTS_DIR } = ctx.paths;
-  const { pendingAuth, daemonUrlRef } = ctx.mcp;
-  const getResolvedPort = () => resolvedPortRef.current;
-  const getDaemonUrl = () => daemonUrlRef.current;
-  // Surfaces the absolute paths to the daemon's Node-compatible runtime and
-  // CLI entry so the Settings → MCP server panel can render snippets that work
-  // even when `od` isn't on the user's PATH (the common case for source clones
-  // - and macOS/Linux ship a /usr/bin/od octal-dump tool that shadows ours
-  // anyway). Cached for 5s because the panel pings on every open and these
-  // paths cannot change without a daemon restart.
-  const INSTALL_INFO_TTL_MS = 5000;
-  let installInfoCache: { t: number; payload: object } | null = null;
+// ─────────────────────────────────────────────────────────────────
+// Domain types
+// ─────────────────────────────────────────────────────────────────
 
-  app.get('/api/mcp/install-info', (req, res) => {
-    if (!isLocalSameOrigin(req, getResolvedPort())) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
+const INSTALL_INFO_TTL_MS = 5000;
+
+interface InstallInfoStore {
+  cached: { t: number; payload: object } | null;
+}
+
+interface McpDomainDeps {
+  installInfoStore: InstallInfoStore;
+  buildInstallPayload: () => object;
+  now: () => number;
+  dataDir: string;
+  templates: readonly McpTemplate[];
+  readConfig: (dataDir: string) => Promise<McpConfig>;
+  writeConfig: (dataDir: string, body: unknown) => Promise<McpConfig>;
+  getToken: (dataDir: string, serverId: string) => Promise<StoredMcpToken | null>;
+  clearToken: (dataDir: string, serverId: string) => Promise<void>;
+  setToken: (dataDir: string, serverId: string, token: StoredMcpToken) => Promise<void>;
+  pendingAuth: PendingAuthCache;
+  beginAuth: (input: BeginAuthInput) => Promise<BeginAuthResult>;
+  getCallbackUrl: () => string;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// GET /api/mcp/install-info
+// ─────────────────────────────────────────────────────────────────
+
+interface InstallInfoOutput {
+  [key: string]: unknown;
+}
+
+function handleGetInstallInfo(
+  _input: void,
+  deps: McpDomainDeps,
+): Result<InstallInfoOutput> {
+  const now = deps.now();
+  if (deps.installInfoStore.cached && now - deps.installInfoStore.cached.t < INSTALL_INFO_TTL_MS) {
+    return ok(deps.installInfoStore.cached.payload as InstallInfoOutput);
+  }
+  const payload = deps.buildInstallPayload();
+  deps.installInfoStore.cached = { t: now, payload };
+  return ok(payload as InstallInfoOutput);
+}
+
+export const getInstallInfoRoute = defineJsonRoute<void, InstallInfoOutput, McpDomainDeps>({
+  method: 'get',
+  path: '/api/mcp/install-info',
+  requireSameOrigin: true,
+  parse: () => ok(undefined),
+  handle: handleGetInstallInfo,
+});
+
+// ─────────────────────────────────────────────────────────────────
+// GET /api/mcp/servers
+// ─────────────────────────────────────────────────────────────────
+
+interface GetServersOutput {
+  servers: McpServerConfig[];
+  templates: readonly McpTemplate[];
+}
+
+async function handleGetServers(
+  _input: void,
+  deps: McpDomainDeps,
+): Promise<Result<GetServersOutput>> {
+  try {
+    const cfg = await deps.readConfig(deps.dataDir);
+    return ok({ servers: cfg.servers, templates: deps.templates });
+  } catch (e: any) {
+    return err(createApiError('INTERNAL_ERROR', String(e?.message ?? e)));
+  }
+}
+
+export const getServersRoute = defineJsonRoute<void, GetServersOutput, McpDomainDeps>({
+  method: 'get',
+  path: '/api/mcp/servers',
+  requireSameOrigin: true,
+  parse: () => ok(undefined),
+  handle: handleGetServers,
+});
+
+// ─────────────────────────────────────────────────────────────────
+// PUT /api/mcp/servers
+// ─────────────────────────────────────────────────────────────────
+
+type PutServersInput = unknown;
+
+interface PutServersOutput {
+  servers: McpServerConfig[];
+  templates: readonly McpTemplate[];
+}
+
+function parsePutServers(raw: { body: unknown }): Result<PutServersInput> {
+  return ok(raw.body);
+}
+
+async function handlePutServers(
+  input: PutServersInput,
+  deps: McpDomainDeps,
+): Promise<Result<PutServersOutput>> {
+  try {
+    const cfg = await deps.writeConfig(deps.dataDir, input);
+    return ok({ servers: cfg.servers, templates: deps.templates });
+  } catch (e: any) {
+    return err(createApiError('BAD_REQUEST', String(e?.message ?? e)));
+  }
+}
+
+export const putServersRoute = defineJsonRoute<PutServersInput, PutServersOutput, McpDomainDeps>({
+  method: 'put',
+  path: '/api/mcp/servers',
+  requireSameOrigin: true,
+  parse: parsePutServers,
+  handle: handlePutServers,
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /api/mcp/oauth/start
+// ─────────────────────────────────────────────────────────────────
+
+interface OAuthStartInput {
+  serverId: string;
+}
+
+interface OAuthStartOutput {
+  authorizeUrl: string;
+  state: string;
+  redirectUri: string;
+}
+
+function parseOAuthStart(raw: { body: unknown }): Result<OAuthStartInput> {
+  const body = (raw.body ?? {}) as Record<string, unknown>;
+  const serverId = typeof body.serverId === 'string' ? body.serverId.trim() : '';
+  if (!serverId) {
+    return err(createApiError('BAD_REQUEST', 'serverId is required'));
+  }
+  return ok({ serverId });
+}
+
+async function handleOAuthStart(
+  input: OAuthStartInput,
+  deps: McpDomainDeps,
+): Promise<Result<OAuthStartOutput>> {
+  try {
+    const cfg = await deps.readConfig(deps.dataDir);
+    const server = cfg.servers.find((s) => s.id === input.serverId);
+    if (!server) {
+      return err(createApiError('NOT_FOUND', `unknown serverId ${input.serverId}`));
     }
-    const now = Date.now();
-    if (installInfoCache && now - installInfoCache.t < INSTALL_INFO_TTL_MS) {
-      return res.json(installInfoCache.payload);
+    if (server.transport !== 'http' && server.transport !== 'sse') {
+      return err(createApiError('BAD_REQUEST', 'OAuth flow only applies to http/sse transports'));
     }
-    // process.execPath is the absolute path to the Node-compatible
-    // runtime that is running the daemon RIGHT NOW. In packaged builds
-    // this may be Electron running with ELECTRON_RUN_AS_NODE=1 rather
-    // than a separate bundled Node binary; the helper surfaces that env
-    // requirement with the command so IDE-spawned MCP clients can
-    // reproduce the same mode from a minimal OS launcher environment.
-    const cliPath = OD_BIN;
-    // The daemon was bootstrapped as a sidecar (tools-dev, packaged) iff
-    // bootstrapSidecarRuntime stamped OD_SIDECAR_IPC_PATH into the env.
-    // In sidecar mode the snippet omits --daemon-url and the spawned
-    // `od mcp` discovers the live URL via the concrete IPC endpoint on
-    // every spawn, so the client config survives ephemeral-port
-    // restarts. For direct `od` / `od --port X` launches there is no
-    // IPC socket; the helper bakes --daemon-url so custom ports keep
-    // working.
-    const sidecarIpcPath = process.env[SIDECAR_ENV.IPC_PATH];
-    const isSidecarMode = sidecarIpcPath != null && sidecarIpcPath.length > 0;
-    const sidecarEnv: Record<string, string> = {};
-    if (isSidecarMode) {
-      sidecarEnv[SIDECAR_ENV.IPC_PATH] = sidecarIpcPath;
+    if (!server.url) {
+      return err(createApiError('BAD_REQUEST', 'server has no URL configured'));
     }
-    const payload = buildMcpInstallPayload({
-      cliPath,
-      cliExists: fs.existsSync(cliPath),
-      execPath: process.execPath,
-      nodeExists: fs.existsSync(process.execPath),
-      port: getResolvedPort(),
-      platform: process.platform,
-      dataDir: RUNTIME_DATA_DIR,
-      electronAsNode: process.env.ELECTRON_RUN_AS_NODE === '1',
-      isSidecarMode,
-      sidecarEnv,
+    if (server.authMode === 'none') {
+      return err(createApiError('BAD_REQUEST', 'server is configured for no managed OAuth'));
+    }
+    const redirectUri = deps.getCallbackUrl();
+    console.log(
+      `[mcp-oauth] start serverId=${input.serverId} url=${server.url} redirect=${redirectUri}`,
+    );
+    const result = await deps.beginAuth({
+      serverId: input.serverId,
+      serverUrl: server.url,
+      redirectUri,
+      dataDir: deps.dataDir,
     });
-    installInfoCache = { t: now, payload };
-    res.json(payload);
-  });
+    deps.pendingAuth.put(result.state, result.pending);
+    console.log(
+      `[mcp-oauth] start ok serverId=${input.serverId} authServer=${result.pending.authServerIssuer} clientId=${result.pending.clientId}`,
+    );
+    return ok({
+      authorizeUrl: result.authorizeUrl,
+      state: result.state,
+      redirectUri,
+    });
+  } catch (e: any) {
+    const msg = e?.message ?? String(e);
+    console.error(`[mcp-oauth] start failed serverId=${input.serverId}:`, msg);
+    return err(createApiError('UPSTREAM_UNAVAILABLE', String(msg)));
+  }
+}
 
-  // External MCP server configuration. Open Design connects to these as a
-  // CLIENT and surfaces their tools to the underlying agent at spawn time.
-  // GET returns user-saved entries plus the built-in template list so the UI
-  // can render the "Add MCP server" picker without a second round-trip.
-  app.get('/api/mcp/servers', async (req, res) => {
-    if (!isLocalSameOrigin(req, getResolvedPort())) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    try {
-      const cfg = await readMcpConfig(RUNTIME_DATA_DIR);
-      res.json({ servers: cfg.servers, templates: MCP_TEMPLATES });
-    } catch (err: any) {
-      res
-        .status(500)
-        .json({ error: String(err && err.message ? err.message : err) });
-    }
-  });
+export const postOAuthStartRoute = defineJsonRoute<OAuthStartInput, OAuthStartOutput, McpDomainDeps>({
+  method: 'post',
+  path: '/api/mcp/oauth/start',
+  requireSameOrigin: true,
+  parse: parseOAuthStart,
+  handle: handleOAuthStart,
+});
 
-  app.put('/api/mcp/servers', async (req, res) => {
-    if (!isLocalSameOrigin(req, getResolvedPort())) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    try {
-      const cfg = await writeMcpConfig(RUNTIME_DATA_DIR, req.body);
-      res.json({ servers: cfg.servers, templates: MCP_TEMPLATES });
-    } catch (err: any) {
-      res
-        .status(400)
-        .json({ error: String(err && err.message ? err.message : err) });
-    }
-  });
+// ─────────────────────────────────────────────────────────────────
+// GET /api/mcp/oauth/status
+// ─────────────────────────────────────────────────────────────────
 
-  // ─────────────────────────────────────────────────────────────────
-  // External MCP server OAuth — daemon-owned authorization flow.
-  //
-  // Replaces per-spawn `mcp-remote` subprocesses. The token is stored
-  // server-side in <dataDir>/mcp-tokens.json and injected as a Bearer
-  // header into the `.mcp.json` we write for Claude Code at spawn time.
-  // The redirect URI points at THIS daemon's public origin so the flow
-  // works the same in local dev (loopback) and in cloud deployments
-  // where OD_PUBLIC_BASE_URL pins the externally-routable URL.
-  // ─────────────────────────────────────────────────────────────────
+interface OAuthStatusInput {
+  serverId: string;
+}
 
-  app.post('/api/mcp/oauth/start', async (req, res) => {
-    if (!isLocalSameOrigin(req, getResolvedPort())) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const serverId =
-      typeof req.body?.serverId === 'string' ? req.body.serverId.trim() : '';
-    if (!serverId) {
-      return res.status(400).json({ error: 'serverId is required' });
-    }
-    try {
-      const cfg = await readMcpConfig(RUNTIME_DATA_DIR);
-      const server = cfg.servers.find((s) => s.id === serverId);
-      if (!server) {
-        return res.status(404).json({ error: `unknown serverId ${serverId}` });
-      }
-      if (server.transport !== 'http' && server.transport !== 'sse') {
-        return res
-          .status(400)
-          .json({ error: 'OAuth flow only applies to http/sse transports' });
-      }
-      if (!server.url) {
-        return res.status(400).json({ error: 'server has no URL configured' });
-      }
-      if (server.authMode === 'none') {
-        return res
-          .status(400)
-          .json({ error: 'server is configured for no managed OAuth' });
-      }
-      const redirectUri = mcpOAuthCallbackUrl(req);
-      console.log(
-        `[mcp-oauth] start serverId=${serverId} url=${server.url} redirect=${redirectUri}`,
-      );
-      const result = await beginAuth({
-        serverId,
-        serverUrl: server.url,
-        redirectUri,
-        dataDir: RUNTIME_DATA_DIR,
-        fetchImpl: fetch,
-      });
-      pendingAuth.put(result.state, result.pending);
-      console.log(
-        `[mcp-oauth] start ok serverId=${serverId} authServer=${result.pending.authServerIssuer} clientId=${result.pending.clientId}`,
-      );
-      res.json({
-        authorizeUrl: result.authorizeUrl,
-        state: result.state,
-        redirectUri,
-      });
-    } catch (err: any) {
-      const msg = err && err.message ? err.message : String(err);
-      console.error(`[mcp-oauth] start failed serverId=${serverId}:`, msg);
-      res.status(502).json({ error: msg });
-    }
-  });
+type OAuthStatusOutput =
+  | { connected: false }
+  | { connected: true; expiresAt: number | null; scope: string | null; savedAt: number };
 
-  // Public endpoint — the OAuth provider's user-agent redirect lands here
-  // after the user approves. We deliberately do NOT enforce
-  // isLocalSameOrigin: in cloud the daemon IS the public origin, and even
-  // locally the request comes back from the OAuth provider's redirect
-  // (no Origin header at all on a top-level navigation).
-  app.get('/api/mcp/oauth/callback', async (req, res) => {
+function parseOAuthStatus(raw: { query: Record<string, unknown> }): Result<OAuthStatusInput> {
+  const serverId = typeof raw.query.serverId === 'string' ? raw.query.serverId.trim() : '';
+  if (!serverId) {
+    return err(createApiError('BAD_REQUEST', 'serverId is required'));
+  }
+  return ok({ serverId });
+}
+
+async function handleOAuthStatus(
+  input: OAuthStatusInput,
+  deps: McpDomainDeps,
+): Promise<Result<OAuthStatusOutput>> {
+  try {
+    const tok = await deps.getToken(deps.dataDir, input.serverId);
+    if (!tok) return ok({ connected: false });
+    return ok({
+      connected: true,
+      expiresAt: tok.expiresAt ?? null,
+      scope: tok.scope ?? null,
+      savedAt: tok.savedAt,
+    });
+  } catch (e: any) {
+    return err(createApiError('INTERNAL_ERROR', String(e?.message ?? e)));
+  }
+}
+
+export const getOAuthStatusRoute = defineJsonRoute<OAuthStatusInput, OAuthStatusOutput, McpDomainDeps>({
+  method: 'get',
+  path: '/api/mcp/oauth/status',
+  requireSameOrigin: true,
+  parse: parseOAuthStatus,
+  handle: handleOAuthStatus,
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /api/mcp/oauth/disconnect
+// ─────────────────────────────────────────────────────────────────
+
+interface OAuthDisconnectInput {
+  serverId: string;
+}
+
+interface OAuthDisconnectOutput {
+  ok: true;
+}
+
+function parseOAuthDisconnect(raw: { body: unknown }): Result<OAuthDisconnectInput> {
+  const body = (raw.body ?? {}) as Record<string, unknown>;
+  const serverId = typeof body.serverId === 'string' ? body.serverId.trim() : '';
+  if (!serverId) {
+    return err(createApiError('BAD_REQUEST', 'serverId is required'));
+  }
+  return ok({ serverId });
+}
+
+async function handleOAuthDisconnect(
+  input: OAuthDisconnectInput,
+  deps: McpDomainDeps,
+): Promise<Result<OAuthDisconnectOutput>> {
+  try {
+    await deps.clearToken(deps.dataDir, input.serverId);
+    return ok({ ok: true });
+  } catch (e: any) {
+    return err(createApiError('INTERNAL_ERROR', String(e?.message ?? e)));
+  }
+}
+
+export const postOAuthDisconnectRoute = defineJsonRoute<OAuthDisconnectInput, OAuthDisconnectOutput, McpDomainDeps>({
+  method: 'post',
+  path: '/api/mcp/oauth/disconnect',
+  requireSameOrigin: true,
+  parse: parseOAuthDisconnect,
+  handle: handleOAuthDisconnect,
+});
+
+// ─────────────────────────────────────────────────────────────────
+// GET /api/mcp/oauth/callback  (HTML — not a JsonRoute)
+//
+// Public endpoint — the OAuth provider's user-agent redirect lands
+// here after the user approves. Returns HTML, not JSON, and
+// deliberately does NOT enforce isLocalSameOrigin.
+// ─────────────────────────────────────────────────────────────────
+
+function registerOAuthCallbackRoute(
+  app: Express,
+  ctx: RegisterMcpRoutesDeps,
+): void {
+  const { RUNTIME_DATA_DIR } = ctx.paths;
+  const { pendingAuth: pendingAuthCache } = ctx.mcp;
+
+  app.get('/api/mcp/oauth/callback', async (req: Request, res: Response) => {
     const code = typeof req.query.code === 'string' ? req.query.code : '';
     const state = typeof req.query.state === 'string' ? req.query.state : '';
     const error = typeof req.query.error === 'string' ? req.query.error : '';
@@ -188,7 +324,7 @@ export function registerMcpRoutes(app: Express, ctx: RegisterMcpRoutesDeps) {
         message: 'Missing code or state — open Settings → External MCP servers and click Connect again.',
       }));
     }
-    const pending = pendingAuth.consume(state);
+    const pending = pendingAuthCache.consume(state);
     if (!pending) {
       return res.status(400).type('html').send(renderOAuthResultPage({
         ok: false,
@@ -215,9 +351,6 @@ export function registerMcpRoutes(app: Express, ctx: RegisterMcpRoutesDeps) {
             ? Date.now() + tokenResp.expires_in * 1000
             : undefined,
         savedAt: Date.now(),
-        // Persist the OAuth client context so refresh-token rotation can
-        // hit the same client_id / token endpoint the upstream issued the
-        // refresh_token to. Refresh tokens are client-bound (RFC 6749 §6).
         tokenEndpoint: pending.tokenEndpoint,
         clientId: pending.clientId,
         clientSecret: pending.clientSecret,
@@ -233,78 +366,94 @@ export function registerMcpRoutes(app: Express, ctx: RegisterMcpRoutesDeps) {
     } catch (err: any) {
       console.error(
         '[mcp-oauth] callback failed:',
-        err && err.message ? err.message : err,
+        err?.message ?? err,
       );
       res.status(502).type('html').send(renderOAuthResultPage({
         ok: false,
-        message: String(err && err.message ? err.message : err),
+        message: String(err?.message ?? err),
       }));
     }
   });
+}
 
-  app.get('/api/mcp/oauth/status', async (req, res) => {
-    if (!isLocalSameOrigin(req, getResolvedPort())) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const serverId =
-      typeof req.query.serverId === 'string' ? req.query.serverId.trim() : '';
-    if (!serverId) return res.status(400).json({ error: 'serverId is required' });
-    try {
-      const tok = await getToken(RUNTIME_DATA_DIR, serverId);
-      if (!tok) return res.json({ connected: false });
-      res.json({
-        connected: true,
-        expiresAt: tok.expiresAt ?? null,
-        scope: tok.scope ?? null,
-        savedAt: tok.savedAt,
+// ─────────────────────────────────────────────────────────────────
+// Route registration (call-site signature unchanged)
+// ─────────────────────────────────────────────────────────────────
+
+export function registerMcpRoutes(app: Express, ctx: RegisterMcpRoutesDeps) {
+  const { resolvedPortRef } = ctx.http;
+  const { OD_BIN, RUNTIME_DATA_DIR } = ctx.paths;
+  const { pendingAuth: pendingAuthCache } = ctx.mcp;
+  const getResolvedPort = () => resolvedPortRef.current;
+
+  const installInfoStore: InstallInfoStore = { cached: null };
+
+  const domainDeps: McpDomainDeps = {
+    installInfoStore,
+    buildInstallPayload: () => {
+      const cliPath = OD_BIN;
+      const sidecarIpcPath = process.env[SIDECAR_ENV.IPC_PATH];
+      const isSidecarMode = sidecarIpcPath != null && sidecarIpcPath.length > 0;
+      const sidecarEnv: Record<string, string> = {};
+      if (isSidecarMode) {
+        sidecarEnv[SIDECAR_ENV.IPC_PATH] = sidecarIpcPath;
+      }
+      return buildMcpInstallPayload({
+        cliPath,
+        cliExists: fs.existsSync(cliPath),
+        execPath: process.execPath,
+        nodeExists: fs.existsSync(process.execPath),
+        port: getResolvedPort(),
+        platform: process.platform,
+        dataDir: RUNTIME_DATA_DIR,
+        electronAsNode: process.env.ELECTRON_RUN_AS_NODE === '1',
+        isSidecarMode,
+        sidecarEnv,
       });
-    } catch (err: any) {
-      res.status(500).json({ error: String(err && err.message ? err.message : err) });
-    }
-  });
+    },
+    now: () => Date.now(),
+    dataDir: RUNTIME_DATA_DIR,
+    templates: MCP_TEMPLATES,
+    readConfig: readMcpConfig,
+    writeConfig: writeMcpConfig,
+    getToken,
+    clearToken,
+    setToken,
+    pendingAuth: pendingAuthCache,
+    beginAuth,
+    getCallbackUrl: () => {
+      const env = process.env.OD_PUBLIC_BASE_URL;
+      if (env && /^https?:\/\//i.test(env)) {
+        return `${env.replace(/\/+$/u, '')}/api/mcp/oauth/callback`;
+      }
+      return `http://localhost:${getResolvedPort()}/api/mcp/oauth/callback`;
+    },
+  };
 
-  app.post('/api/mcp/oauth/disconnect', async (req, res) => {
-    if (!isLocalSameOrigin(req, getResolvedPort())) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const serverId =
-      typeof req.body?.serverId === 'string' ? req.body.serverId.trim() : '';
-    if (!serverId) return res.status(400).json({ error: 'serverId is required' });
-    try {
-      await clearToken(RUNTIME_DATA_DIR, serverId);
-      res.json({ ok: true });
-    } catch (err: any) {
-      res.status(500).json({ error: String(err && err.message ? err.message : err) });
-    }
-  });
+  const adapter = { resolvedPortRef };
+  mountJsonRoute(app, getInstallInfoRoute, domainDeps, adapter);
+  mountJsonRoute(app, getServersRoute, domainDeps, adapter);
+  mountJsonRoute(app, putServersRoute, domainDeps, adapter);
+  mountJsonRoute(app, postOAuthStartRoute, domainDeps, adapter);
+  mountJsonRoute(app, getOAuthStatusRoute, domainDeps, adapter);
+  mountJsonRoute(app, postOAuthDisconnectRoute, domainDeps, adapter);
 
-
+  registerOAuthCallbackRoute(app, ctx);
 }
 
-function getPublicBaseUrl(req: any) {
-  const env = process.env.OD_PUBLIC_BASE_URL;
-  if (env && /^https?:\/\//i.test(env)) {
-    return env.replace(/\/+$/u, '');
-  }
-  const proto = req.protocol || 'http';
-  const host = req.get('host');
-  if (!host) return `http://localhost:${process.env.OD_PORT ?? '7456'}`;
-  return `${proto}://${host}`;
-}
-
-function mcpOAuthCallbackUrl(req: any) {
-  return `${getPublicBaseUrl(req)}/api/mcp/oauth/callback`;
-}
+// ─────────────────────────────────────────────────────────────────
+// OAuth callback HTML helpers (used only by the callback route)
+// ─────────────────────────────────────────────────────────────────
 
 function renderOAuthResultPage(opts: any) {
-  const ok = Boolean(opts.ok);
-  const title = ok ? 'Connected' : 'Authorization failed';
-  const heading = ok ? '✅ Connected' : '⚠️ Authorization failed';
-  const body = ok
+  const isOk = Boolean(opts.ok);
+  const title = isOk ? 'Connected' : 'Authorization failed';
+  const heading = isOk ? '✅ Connected' : '⚠️ Authorization failed';
+  const body = isOk
     ? `Your MCP server <code>${escapeHtml(opts.serverId ?? '')}</code> is now connected. You can close this tab and return to Open Design.`
     : escapeHtml(opts.message ?? 'Authorization could not be completed.');
-  const accent = ok ? '#1a7f37' : '#cf222e';
-  const payload = ok
+  const accent = isOk ? '#1a7f37' : '#cf222e';
+  const payload = isOk
     ? { type: 'mcp-oauth', ok: true, serverId: opts.serverId ?? null }
     : { type: 'mcp-oauth', ok: false, message: opts.message ?? null };
   return `<!doctype html>
